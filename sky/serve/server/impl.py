@@ -3,6 +3,7 @@ import pathlib
 import re
 import shlex
 import signal
+import sys
 import tempfile
 import threading
 import typing
@@ -348,7 +349,14 @@ def up(
             run_script = '\n'.join(env_cmds + [run_script])
             # Dump script for high availability recovery.
             serve_state.set_ha_recovery_script(service_name, run_script)
-            backend.run_on_head(controller_handle, run_script)
+            # Use launch_new_process_tree to properly daemonize the
+            # controller process. backend.run_on_head() goes through
+            # run_with_log() which attaches a kill daemon that would
+            # terminate the controller's entire process group as soon
+            # as the launching shell exits.
+            local_run_script = run_script.replace(
+                constants.SKY_PYTHON_CMD, sys.executable)
+            subprocess_utils.launch_new_process_tree(local_run_script)
 
         style = colorama.Style
         fore = colorama.Fore

@@ -10,6 +10,7 @@ import pickle
 import re
 import shlex
 import shutil
+import sys
 import time
 import traceback
 import typing
@@ -34,13 +35,13 @@ from sky.serve import spot_placer
 from sky.skylet import constants as skylet_constants
 from sky.skylet import job_lib
 from sky.utils import annotations
-from sky.utils import command_runner
 from sky.utils import common_utils
 from sky.utils import controller_utils
 from sky.utils import log_utils
 from sky.utils import message_utils
 from sky.utils import resources_utils
 from sky.utils import status_lib
+from sky.utils import subprocess_utils
 from sky.utils import ux_utils
 from sky.utils import yaml_utils
 
@@ -275,7 +276,6 @@ def ha_recovery_for_consolidation_mode(pool: bool):
     # No setup recovery is needed in consolidation mode, as the API server
     # already has all runtime installed. Directly start jobs recovery here.
     # Refers to sky/templates/kubernetes-ray.yml.j2 for more details.
-    runner = command_runner.LocalProcessCommandRunner()
     noun = 'pool' if pool else 'serve'
     capnoun = noun.capitalize()
     prefix = f'{noun}_'
@@ -309,10 +309,18 @@ def ha_recovery_for_consolidation_mode(pool: bool):
                 f.write(f'{capnoun} {service_name}\'s recovery script does '
                         'not exist. Skipping recovery.\n')
                 continue
-            rc, out, err = runner.run(script, require_outputs=True)
-            if rc:
-                f.write(f'Recovery script returned {rc}. '
-                        f'Output: {out}\nError: {err}\n')
+            # Use launch_new_process_tree to properly daemonize the
+            # controller process (same rationale as in impl.up()).
+            local_script = script.replace(
+                skylet_constants.SKY_PYTHON_CMD, sys.executable)
+            try:
+                pid = subprocess_utils.launch_new_process_tree(
+                    local_script)
+                f.write(f'Started controller (PID: {pid}) for '
+                        f'{noun} {service_name}\n')
+            except Exception as e:  # pylint: disable=broad-except
+                f.write(f'Recovery script failed to launch for '
+                        f'{noun} {service_name}: {e}\n')
             f.write(f'{capnoun} {service_name} completed recovery at '
                     f'{datetime.datetime.now()}\n')
         f.write(f'HA recovery completed at {datetime.datetime.now()}\n')
