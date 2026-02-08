@@ -78,10 +78,9 @@ def launch(name: str,
       *  `georegion`: This is a feature flag to provide an additional
          scope of geographical specificy while maintaining backward
          compatibility.
-      *  `chunked`: This is a feature flag to give breadth to the
-         snowflake nature of the vast catalog marketplace. It rounds
-         down various specifications of machines to emulate an instance
-         type and make them more interchangeable.
+      *  We do NOT use the SDK's 'chunked' flag here because it
+         zeros out min_bid, which breaks spot/bid pricing. The
+         catalog fetcher handles spec normalization separately.
       *  `disk_size`: We look for instances that are of the requested
          size or greater than it. For instance, `disk_size=100` might
          return something with `disk_size` at 102 or even 1000.
@@ -112,7 +111,6 @@ def launch(name: str,
     num_gpus = int(instance_type.split('-')[0].replace('x', ''))
 
     query = [
-        'chunked=true',
         'georegion=true',
         f'geolocation="{region[-2:]}"',
         f'disk_space>={disk_size}',
@@ -131,6 +129,14 @@ def launch(name: str,
         raise RuntimeError('Failed to create instances, could not find an '
                            'offer that satisfies the requirements '
                            f'"{query_str}".')
+
+    # Sort by min_bid for spot instances so we pick the cheapest
+    # offer, or by dph_total for on-demand. The default API order
+    # is by score which doesn't optimize for cost.
+    if preemptible:
+        instance_list.sort(key=lambda o: o.get('min_bid', float('inf')))
+    else:
+        instance_list.sort(key=lambda o: o.get('dph_total', float('inf')))
 
     instance_touse = instance_list[0]
 

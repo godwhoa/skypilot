@@ -11,7 +11,7 @@ import json
 import math
 import os
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 from sky.adaptors import vast
 
@@ -22,6 +22,13 @@ _map = {
     'QRTX6000': 'RTX6000',
     'QRTX8000': 'RTX8000'
 }
+
+# Minimum spec thresholds used to filter and normalize offers
+# into consistent instance types. These mirror the Vast SDK's
+# 'chunked' mode logic, except we intentionally preserve
+# min_bid (the SDK zeros it out, breaking spot pricing).
+_MIN_CPU_RAM = 64 * 1024  # 64 GiB in MiB
+_MIN_CPU_CORES = 32
 
 
 def create_instance_type(obj: Dict[str, Any]) -> str:
@@ -36,61 +43,17 @@ def dot_get(d: dict, key: str) -> Any:
     return d
 
 
-def _build_spot_price_map(
-    spot_offers: List[Dict[str, Any]],
-) -> Dict[Tuple, List[float]]:
-    """Build a mapping of (gpu_name, num_gpus, region_code, hosting_type)
-    to list of min_bid values from a non-chunked query.
-
-    The Vast SDK's 'chunked' mode zeros out the min_bid field,
-    so a separate non-chunked query is needed to retrieve real
-    spot/bid pricing from the marketplace.
-    """
-    spot_map: Dict[Tuple, List[float]] = collections.defaultdict(list)
-    if not isinstance(spot_offers, list):
-        return spot_map
-    for offer in spot_offers:
-        min_bid = offer.get('min_bid')
-        if min_bid is not None and min_bid > 0:
-            geolocation = offer.get('geolocation', '')
-            region_code = geolocation[-2:] if len(geolocation) >= 2 else ''
-            hosting_type = offer.get('hosting_type', 0)
-            key = (offer['gpu_name'], offer['num_gpus'], region_code,
-                   hosting_type)
-            spot_map[key].append(min_bid)
-    return spot_map
-
-
-def _get_spot_price(
-    spot_map: Dict[Tuple, List[float]],
-    gpu_name: str,
-    num_gpus: int,
-    region_code: str,
-    hosting_type: int,
-) -> str:
-    """Look up the median spot price from the spot price map.
-
-    Returns a formatted price string, or empty string if no
-    spot pricing data is available for the given combination.
-    """
-    key = (gpu_name, num_gpus, region_code, hosting_type)
-    bids = spot_map.get(key, [])
-    if not bids:
-        return ''
-    bids_sorted = sorted(bids)
-    index = math.ceil(0.5 * len(bids_sorted)) - 1
-    return f'{bids_sorted[index]:.2f}'
+def _median(values: List[float]) -> float:
+    """Return the upper-median of a sorted list."""
+    values = sorted(values)
+    index = math.ceil(0.5 * len(values)) - 1
+    return values[index]
 
 
 if __name__ == '__main__':
-    seen = set()
-    # InstanceList is the buffered list to emit to
-    # the CSV
-    csvList = []
+    seen: set = set()
+    csvList: List[Dict] = []
 
-    # InstanceType and gpuInfo are basically just stubs
-    # so that the dictwriter is happy without weird
-    # code.
     mapped_keys = (('gpu_name', 'InstanceType'), ('gpu_name',
                                                   'AcceleratorName'),
                    ('num_gpus', 'AcceleratorCount'), ('cpu_cores', 'vCPUs'),
@@ -98,49 +61,35 @@ if __name__ == '__main__':
                    ('search.totalHour', 'Price'), ('min_bid', 'SpotPrice'),
                    ('geolocation', 'Region'), ('hosting_type', 'HostingType'))
 
-    # Vast has a wide variety of machines, some of
-    # which will have less diskspace and network
-    # bandwidth than others.
+    # We query WITHOUT the SDK's 'chunked' flag. The SDK's chunked
+    # mode zeros out min_bid for all results, which makes every spot
+    # price appear as $0.00. Instead we apply the same filtering and
+    # normalization ourselves below, preserving min_bid.
     #
-    # The machine normally have high specificity
-    # in the vast catalog - this is fairly unique
-    # to Vast and can make bucketing them into
-    # instance types difficult.
-    #
-    # The flags
-    #
-    #   * georegion consolidates geographic areas
-    #
-    #   * chunked rounds down specifications (such
-    #     as 1025GB to 1024GB disk) in order to
-    #     make machine specifications look more
-    #     consistent
-    #
-    #   * inet_down makes sure that only machines
-    #     with "reasonable" downlink speed are
-    #     considered
-    #
-    #   * disk_space sets a lower limit of how
-    #     much space is availble to be allocated
-    #     in order to ensure that machines with
-    #     small disk pools aren't listed
-    #
+    # georegion: consolidates geographic areas into continent codes
+    # inet_down >= 100: only machines with reasonable bandwidth
+    # disk_space >= 80: only machines with enough disk
     offerList = vast.vast().search_offers(
-        query=('georegion = true chunked = true '
+        query=('georegion = true '
                'inet_down >= 100 disk_space >= 80'),
         limit=10000)
 
-    # Second query without 'chunked' to get real min_bid values.
-    # The Vast SDK's 'chunked' mode zeros out min_bid for all
-    # results, making all spot prices appear as $0.00. This
-    # separate call retrieves actual spot/bid pricing.
-    spotOfferList = vast.vast().search_offers(
-        query='georegion = true inet_down >= 100 disk_space >= 80',
-        limit=10000)
-    spotPriceMap = _build_spot_price_map(spotOfferList)
-
     priceMap: Dict[str, List] = collections.defaultdict(list)
-    for offer in offerList:
+    for offer in (offerList if isinstance(offerList, list) else []):
+        # Apply the same filtering the SDK's chunked mode does:
+        # skip machines below minimum spec thresholds.
+        if (offer.get('cpu_ram') or 0) < _MIN_CPU_RAM:
+            continue
+        if (offer.get('cpu_cores') or 0) < _MIN_CPU_CORES:
+            continue
+
+        # Normalize cpu_ram and cpu_cores to fixed values so
+        # machines with slightly different specs bucket into
+        # the same instance type. This is what 'chunked' does,
+        # minus the min_bid=0 clobber.
+        offer['cpu_ram'] = _MIN_CPU_RAM
+        offer['cpu_cores'] = _MIN_CPU_CORES
+
         entry = {}
         for ours, theirs in mapped_keys:
             field = dot_get(offer, ours)
@@ -149,15 +98,6 @@ if __name__ == '__main__':
         instance_type = create_instance_type(offer)
         entry['InstanceType'] = instance_type
 
-        # the documentation says
-        # "{'gpus': [{
-        #   'name': 'v100',
-        #   'manufacturer': 'nvidia',
-        #   'count': 8.0,
-        #   'memoryinfo': {'sizeinmib': 16384}
-        #   }],
-        #   'totalgpumemoryinmib': 16384}",
-        # we can do that.
         entry['MemoryGiB'] /= 1024
 
         gpu = re.sub('Ada', '-Ada', re.sub(r'\s', '', offer['gpu_name']))
@@ -179,23 +119,32 @@ if __name__ == '__main__':
             'TotalGpuMemoryInMiB': offer['gpu_total_ram']
         }).replace('"', '\'')
 
-        # Store raw offer fields for spot price lookup later.
-        # These are removed before writing to CSV.
-        entry['_gpu_name'] = offer['gpu_name']
-        entry['_num_gpus'] = offer['num_gpus']
-
         priceMap[instance_type].append(entry)
 
     for instanceList in priceMap.values():
+        # Compute median on-demand price across all offers
+        # for this instance type, then keep only offers at
+        # or below the median.
         priceList = sorted([x['Price'] for x in instanceList])
-        index = math.ceil(0.5 * len(priceList)) - 1
-        priceTarget = priceList[index]
+        priceTarget = _median(priceList)
         toList: List = []
         for instance in instanceList:
             if instance['Price'] <= priceTarget:
                 instance['Price'] = '{:.2f}'.format(priceTarget)
                 toList.append(instance)
 
+        # Compute median spot price (min_bid) for this instance
+        # type. Only include positive bids.
+        spotBids = [
+            x['SpotPrice'] for x in toList
+            if x.get('SpotPrice') is not None and x['SpotPrice'] > 0
+        ]
+        spotPrice = f'{_median(spotBids):.2f}' if spotBids else ''
+
+        # Dedup: emit one representative entry per
+        # (instance_type, continent, hosting_type) combination.
+        # Requires at least two matching offers to confirm
+        # the instance type has real availability.
         for instance in toList:
             hosting_type = instance.get('HostingType', 0)
             stub = (f'{instance["InstanceType"]} '
@@ -203,16 +152,7 @@ if __name__ == '__main__':
             if stub in seen:
                 printstub = f'{stub}#print'
                 if printstub not in seen:
-                    # Look up real spot price from the non-chunked
-                    # query instead of using the zeroed min_bid.
-                    region_code = instance['Region'][-2:]
-                    instance['SpotPrice'] = _get_spot_price(
-                        spotPriceMap,
-                        instance.pop('_gpu_name'),
-                        instance.pop('_num_gpus'),
-                        region_code,
-                        hosting_type,
-                    )
+                    instance['SpotPrice'] = spotPrice
                     csvList.append(instance)
                     seen.add(printstub)
             else:
@@ -220,11 +160,9 @@ if __name__ == '__main__':
 
     os.makedirs('vast', exist_ok=True)
     with open('vast/vms.csv', 'w', newline='', encoding='utf-8') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=[x[1] for x in mapped_keys])
+        writer = csv.DictWriter(csvfile,
+                                fieldnames=[x[1] for x in mapped_keys])
         writer.writeheader()
 
         for instance in csvList:
-            # Remove internal fields that aren't part of the CSV schema
-            instance.pop('_gpu_name', None)
-            instance.pop('_num_gpus', None)
             writer.writerow(instance)
