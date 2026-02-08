@@ -11,7 +11,7 @@ import json
 import math
 import os
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from sky.adaptors import vast
 
@@ -34,6 +34,52 @@ def dot_get(d: dict, key: str) -> Any:
     for k in key.split('.'):
         d = d[k]
     return d
+
+
+def _build_spot_price_map(
+    spot_offers: List[Dict[str, Any]],
+) -> Dict[Tuple, List[float]]:
+    """Build a mapping of (gpu_name, num_gpus, region_code, hosting_type)
+    to list of min_bid values from a non-chunked query.
+
+    The Vast SDK's 'chunked' mode zeros out the min_bid field,
+    so a separate non-chunked query is needed to retrieve real
+    spot/bid pricing from the marketplace.
+    """
+    spot_map: Dict[Tuple, List[float]] = collections.defaultdict(list)
+    if not isinstance(spot_offers, list):
+        return spot_map
+    for offer in spot_offers:
+        min_bid = offer.get('min_bid')
+        if min_bid is not None and min_bid > 0:
+            geolocation = offer.get('geolocation', '')
+            region_code = geolocation[-2:] if len(geolocation) >= 2 else ''
+            hosting_type = offer.get('hosting_type', 0)
+            key = (offer['gpu_name'], offer['num_gpus'], region_code,
+                   hosting_type)
+            spot_map[key].append(min_bid)
+    return spot_map
+
+
+def _get_spot_price(
+    spot_map: Dict[Tuple, List[float]],
+    gpu_name: str,
+    num_gpus: int,
+    region_code: str,
+    hosting_type: int,
+) -> str:
+    """Look up the median spot price from the spot price map.
+
+    Returns a formatted price string, or empty string if no
+    spot pricing data is available for the given combination.
+    """
+    key = (gpu_name, num_gpus, region_code, hosting_type)
+    bids = spot_map.get(key, [])
+    if not bids:
+        return ''
+    bids_sorted = sorted(bids)
+    index = math.ceil(0.5 * len(bids_sorted)) - 1
+    return f'{bids_sorted[index]:.2f}'
 
 
 if __name__ == '__main__':
@@ -84,6 +130,15 @@ if __name__ == '__main__':
                'inet_down >= 100 disk_space >= 80'),
         limit=10000)
 
+    # Second query without 'chunked' to get real min_bid values.
+    # The Vast SDK's 'chunked' mode zeros out min_bid for all
+    # results, making all spot prices appear as $0.00. This
+    # separate call retrieves actual spot/bid pricing.
+    spotOfferList = vast.vast().search_offers(
+        query='georegion = true inet_down >= 100 disk_space >= 80',
+        limit=10000)
+    spotPriceMap = _build_spot_price_map(spotOfferList)
+
     priceMap: Dict[str, List] = collections.defaultdict(list)
     for offer in offerList:
         entry = {}
@@ -124,6 +179,11 @@ if __name__ == '__main__':
             'TotalGpuMemoryInMiB': offer['gpu_total_ram']
         }).replace('"', '\'')
 
+        # Store raw offer fields for spot price lookup later.
+        # These are removed before writing to CSV.
+        entry['_gpu_name'] = offer['gpu_name']
+        entry['_num_gpus'] = offer['num_gpus']
+
         priceMap[instance_type].append(entry)
 
     for instanceList in priceMap.values():
@@ -136,7 +196,6 @@ if __name__ == '__main__':
                 instance['Price'] = '{:.2f}'.format(priceTarget)
                 toList.append(instance)
 
-        maxBid = max([x.get('SpotPrice') for x in toList])
         for instance in toList:
             hosting_type = instance.get('HostingType', 0)
             stub = (f'{instance["InstanceType"]} '
@@ -144,7 +203,16 @@ if __name__ == '__main__':
             if stub in seen:
                 printstub = f'{stub}#print'
                 if printstub not in seen:
-                    instance['SpotPrice'] = f'{maxBid:.2f}'
+                    # Look up real spot price from the non-chunked
+                    # query instead of using the zeroed min_bid.
+                    region_code = instance['Region'][-2:]
+                    instance['SpotPrice'] = _get_spot_price(
+                        spotPriceMap,
+                        instance.pop('_gpu_name'),
+                        instance.pop('_num_gpus'),
+                        region_code,
+                        hosting_type,
+                    )
                     csvList.append(instance)
                     seen.add(printstub)
             else:
@@ -156,4 +224,7 @@ if __name__ == '__main__':
         writer.writeheader()
 
         for instance in csvList:
+            # Remove internal fields that aren't part of the CSV schema
+            instance.pop('_gpu_name', None)
+            instance.pop('_num_gpus', None)
             writer.writerow(instance)
