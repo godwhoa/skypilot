@@ -554,6 +554,49 @@ def get_service_from_name(service_name: str) -> Optional[Dict[str, Any]]:
 
 
 @init_db
+def get_service_record_direct(service_name: str) -> Optional[Dict[str, Any]]:
+    """Get a service record directly from the services table.
+
+    Unlike get_service_from_name(), this does NOT join with version_specs,
+    so it can find services that exist in the services table but have no
+    version_specs entries yet (e.g. during the window between add_service()
+    and add_or_update_version() in service.py, or when the service is in
+    an inconsistent state).
+
+    This is used as a fallback for cleanup operations that need to find
+    orphaned service records.
+    """
+    assert _SQLALCHEMY_ENGINE is not None
+    with orm.Session(_SQLALCHEMY_ENGINE) as session:
+        result = session.execute(
+            sqlalchemy.select(services_table).where(
+                services_table.c.name == service_name)).fetchone()
+    if result is None:
+        return None
+    r = result._mapping  # pylint: disable=protected-access
+    return {
+        'name': r['name'],
+        'controller_job_id': r['controller_job_id'],
+        'controller_port': r['controller_port'],
+        'load_balancer_port': r['load_balancer_port'],
+        'status': ServiceStatus[r['status']],
+        'uptime': r['uptime'],
+        'policy': r['policy'],
+        'version': None,
+        'active_versions': json.loads(r['active_versions'])
+                           if r['active_versions'] else [],
+        'requested_resources_str': r['requested_resources_str'],
+        'load_balancing_policy': r['load_balancing_policy'],
+        'tls_encrypted': bool(r['tls_encrypted']),
+        'pool': bool(r['pool']),
+        'controller_pid': r['controller_pid'],
+        'hash': r['hash'],
+        'entrypoint': r['entrypoint'],
+        'yaml_content': None,
+    }
+
+
+@init_db
 def get_service_hash(service_name: str) -> Optional[str]:
     """Get the hash of a service."""
     assert _SQLALCHEMY_ENGINE is not None

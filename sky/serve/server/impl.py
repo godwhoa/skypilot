@@ -135,6 +135,35 @@ def _maybe_display_run_warning(task: 'task_lib.Task') -> None:
             f'`run` section.{colorama.Style.RESET_ALL}')
 
 
+def _send_terminate_on_failure(
+        service_name: str, pool: bool,
+        controller_handle: Optional['backends.CloudVmRayResourceHandle'],
+        backend: Optional['backends.CloudVmRayBackend']) -> None:
+    """Best-effort: send TERMINATE signal to service.py on init failure.
+
+    When wait_service_registration() fails, the service.py process may
+    still be running in its while-True loop. We write the TERMINATE signal
+    file so that service.py picks it up and triggers its cleanup (finally
+    block), preventing orphaned controller/LB processes.
+
+    In consolidation mode the signal file is local; otherwise we run a
+    remote command on the controller head.
+    """
+    try:
+        if serve_utils.is_consolidation_mode(pool):
+            serve_utils.send_terminate_signal(service_name)
+        elif controller_handle is not None and backend is not None:
+            # Write the signal file on the remote controller VM.
+            signal_file = serve_constants.SIGNAL_FILE_PATH.format(service_name)
+            cmd = (f'python3 -c "import pathlib; '
+                   f"p = pathlib.Path('{signal_file}'); "
+                   f"p.write_text('terminate')\"")
+            backend.run_on_head(controller_handle, cmd, stream_logs=False)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning(f'Failed to send terminate signal to service '
+                       f'{service_name!r} on init failure: {e}')
+
+
 def up(
     task: 'task_lib.Task',
     service_name: Optional[str] = None,
@@ -363,6 +392,11 @@ def up(
                         lb_port_payload)
         except (exceptions.CommandError, grpc.FutureTimeoutError,
                 grpc.RpcError):
+            # Send TERMINATE signal to the service.py process so it
+            # triggers its cleanup (finally block) and doesn't leave
+            # orphaned controller/LB processes behind.
+            _send_terminate_on_failure(service_name, pool, controller_handle,
+                                       backend)
             if serve_utils.is_consolidation_mode(pool):
                 with ux_utils.print_exception_no_traceback():
                     raise RuntimeError(

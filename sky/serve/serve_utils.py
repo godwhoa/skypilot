@@ -159,6 +159,19 @@ _SIGNAL_TO_ERROR = {
 }
 
 
+def send_terminate_signal(service_name: str) -> None:
+    """Write a TERMINATE signal file for the given service.
+
+    This causes the service.py parent process to pick up the signal via
+    _handle_signal() and trigger its cleanup (finally block).
+    """
+    signal_file = pathlib.Path(constants.SIGNAL_FILE_PATH.format(service_name))
+    with filelock.FileLock(str(signal_file) + '.lock'):
+        with signal_file.open(mode='w', encoding='utf-8') as f:
+            f.write(UserSignal.TERMINATE.value)
+            f.flush()
+
+
 class RequestsAggregator:
     """Base class for request aggregator."""
 
@@ -496,9 +509,10 @@ def set_service_status_and_active_versions_from_replica(
     if record is None:
         with ux_utils.print_exception_no_traceback():
             raise ValueError(
-                'The service is up-ed in an old version and does not '
-                'support update. Please `sky serve down` '
-                'it first and relaunch the service.')
+                f'Service {service_name!r} is in an inconsistent state '
+                '(no version record found). Try '
+                f'`sky serve down {service_name} --purge` to force '
+                'cleanup, then relaunch the service.')
     if record['status'] == serve_state.ServiceStatus.SHUTTING_DOWN:
         # When the service is shutting down, there is a period of time which the
         # controller still responds to the request, and the replica is not
@@ -1055,6 +1069,87 @@ def get_next_cluster_name(
         return replica_info.cluster_name
 
 
+def _kill_orphaned_processes(service_name: str, service_dir: str) -> None:
+    """Best-effort kill orphaned service/controller processes.
+
+    Reads PIDs from the controller PID file stored in the service directory
+    and kills them if they are still running.
+    """
+    pid_file = os.path.join(service_dir, constants.CONTROLLER_PID_FILE)
+    if not os.path.exists(pid_file):
+        return
+    try:
+        with open(pid_file, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+        pids = [int(p) for p in content.splitlines() if p.strip()]
+        for pid in pids:
+            try:
+                proc = psutil.Process(pid)
+                # Verify this is actually a SkyPilot-related process
+                # to avoid killing unrelated processes that reused the PID.
+                cmdline = ' '.join(proc.cmdline())
+                if service_name in cmdline or 'sky.serve' in cmdline:
+                    logger.info(f'Killing orphaned process {pid} for '
+                                f'service {service_name!r}')
+                    proc.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    except (OSError, ValueError) as e:
+        logger.debug(f'Failed to read PID file for {service_name!r}: {e}')
+
+
+def _cleanup_orphaned_service(service_name: str) -> Optional[str]:
+    """Clean up orphaned service state when the service record is invisible.
+
+    This handles the case where a service exists in the DB but has no
+    version_specs entries (making it invisible to get_service_from_name),
+    or where the service directory exists on disk but the DB record is
+    gone. Kills orphaned processes, removes stale directories and DB
+    records.
+
+    Returns:
+        A message describing what was cleaned up, or None if nothing
+        was found to clean up.
+    """
+    service_dir = os.path.expanduser(
+        generate_remote_service_dir_name(service_name))
+    dir_exists = os.path.exists(service_dir)
+
+    # Check if a DB record exists via the direct query (bypassing the
+    # version_specs INNER JOIN that get_service_from_name uses).
+    direct_record = serve_state.get_service_record_direct(service_name)
+
+    if not dir_exists and direct_record is None:
+        # Nothing orphaned — service truly doesn't exist.
+        return None
+
+    # Kill any orphaned processes before removing files.
+    if dir_exists:
+        _kill_orphaned_processes(service_name, service_dir)
+
+    # Clean up replicas from DB if any.
+    for replica_info in serve_state.get_replica_infos(service_name):
+        serve_state.remove_replica(service_name, replica_info.replica_id)
+
+    # Remove the service directory.
+    if dir_exists:
+        shutil.rmtree(service_dir, ignore_errors=True)
+
+    # Remove DB records.
+    serve_state.remove_service(service_name)
+    serve_state.delete_all_versions(service_name)
+    serve_state.remove_ha_recovery_script(service_name)
+
+    details = []
+    if dir_exists:
+        details.append('stale directory')
+    if direct_record is not None:
+        details.append('orphaned DB record')
+    return (f'{colorama.Fore.YELLOW}Cleaned up orphaned state for '
+            f'{service_name!r} ({", ".join(details)}).'
+            f'{colorama.Style.RESET_ALL}')
+
+
 def _terminate_failed_services(
         service_name: str,
         service_status: Optional[serve_state.ServiceStatus]) -> Optional[str]:
@@ -1081,7 +1176,10 @@ def _terminate_failed_services(
 
     service_dir = os.path.expanduser(
         generate_remote_service_dir_name(service_name))
-    shutil.rmtree(service_dir)
+    # Kill orphaned processes before removing the directory.
+    _kill_orphaned_processes(service_name, service_dir)
+    if os.path.exists(service_dir):
+        shutil.rmtree(service_dir)
     serve_state.remove_service(service_name)
     serve_state.delete_all_versions(service_name)
     serve_state.remove_ha_recovery_script(service_name)
@@ -1108,6 +1206,29 @@ def terminate_services(service_names: Optional[List[str]], purge: bool,
                                              pool=pool,
                                              with_replica_info=False)
         if service_status is None:
+            # The service is invisible to the normal query (which JOINs
+            # with version_specs). Check for and clean up orphaned state:
+            # stale directories and/or DB records without version_specs.
+            if purge:
+                cleanup_msg = _cleanup_orphaned_service(service_name)
+                if cleanup_msg is not None:
+                    messages.append(cleanup_msg)
+                    terminated_service_names.append(f'{service_name!r}')
+            else:
+                # Check if there is actually orphaned state to report.
+                service_dir = os.path.expanduser(
+                    generate_remote_service_dir_name(service_name))
+                direct_record = (
+                    serve_state.get_service_record_direct(service_name))
+                if os.path.exists(service_dir) or direct_record is not None:
+                    purge_cmd = (f'sky jobs pool down {service_name} --purge'
+                                 if pool else
+                                 f'sky serve down {service_name} --purge')
+                    messages.append(
+                        f'{colorama.Fore.YELLOW}{capnoun} '
+                        f'{service_name!r} is in an inconsistent '
+                        f'state. Use `{purge_cmd}` to force cleanup.'
+                        f'{colorama.Style.RESET_ALL}')
             continue
         if (service_status is not None and service_status['status']
                 == serve_state.ServiceStatus.SHUTTING_DOWN):
@@ -1157,14 +1278,7 @@ def terminate_services(service_names: Optional[List[str]], purge: bool,
                 continue
         else:
             # Send the terminate signal to controller.
-            signal_file = pathlib.Path(
-                constants.SIGNAL_FILE_PATH.format(service_name))
-            # Filelock is needed to prevent race condition between signal
-            # check/removal and signal writing.
-            with filelock.FileLock(str(signal_file) + '.lock'):
-                with signal_file.open(mode='w', encoding='utf-8') as f:
-                    f.write(UserSignal.TERMINATE.value)
-                    f.flush()
+            send_terminate_signal(service_name)
         terminated_service_names.append(f'{service_name!r}')
     if not terminated_service_names:
         messages.append(f'No {noun} to terminate.')

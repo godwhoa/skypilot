@@ -12,6 +12,11 @@ PORT_SELECTION_FILE_LOCK_PATH = f'{SKYSERVE_METADATA_DIR}/port_selection.lock'
 # Signal file path for controller to handle signals.
 SIGNAL_FILE_PATH = '/tmp/sky_serve_controller_signal_{}'
 
+# PID file name stored in the service directory as a fallback for cleanup.
+# This allows cleanup code to find and kill orphaned controller processes
+# even when the DB record is missing or inconsistent.
+CONTROLLER_PID_FILE = 'controller.pid'
+
 # Time to wait in seconds for controller to setup, this involves the time to run
 # cloud dependencies installation.
 CONTROLLER_SETUP_TIMEOUT_SECONDS = 300

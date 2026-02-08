@@ -342,6 +342,13 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                       controller_port))
             controller_process.start()
 
+            # Write controller and service PIDs to a file as a fallback
+            # for cleanup. This allows terminate_services to find and kill
+            # orphaned processes even when the DB record is missing.
+            pid_file = os.path.join(service_dir, constants.CONTROLLER_PID_FILE)
+            with open(pid_file, 'w', encoding='utf-8') as f:
+                f.write(f'{os.getpid()}\n{controller_process.pid}')
+
             if not is_recovery:
                 serve_state.set_service_controller_port(service_name,
                                                         controller_port)
