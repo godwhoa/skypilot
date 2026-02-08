@@ -356,7 +356,22 @@ def up(
             # as the launching shell exits.
             local_run_script = run_script.replace(
                 constants.SKY_PYTHON_CMD, sys.executable)
-            subprocess_utils.launch_new_process_tree(local_run_script)
+
+            # Write script + capture launch output for debuggability.
+            import os as _os  # pylint: disable=import-outside-toplevel
+            _serve_dir = _os.path.expanduser(
+                f'~/.sky/serve/{service_name.replace("-", "_")}')
+            _os.makedirs(_serve_dir, exist_ok=True)
+            _script_path = _os.path.join(_serve_dir, 'launch_script.sh')
+            _launch_log = _os.path.join(_serve_dir, 'launch_debug.log')
+            with open(_script_path, 'w') as _f:
+                _f.write(local_run_script)
+            logger.info(f'Controller script saved to {_script_path}')
+
+            pid = subprocess_utils.launch_new_process_tree(
+                local_run_script, log_output=_launch_log)
+            logger.info(f'Controller launched with PID {pid}, '
+                        f'launch log: {_launch_log}')
 
         style = colorama.Style
         fore = colorama.Fore
